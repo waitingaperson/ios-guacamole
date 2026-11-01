@@ -1,0 +1,1062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 1 Nov 2026 20:30:00 +0800
+Subject: [PATCH] sweet: add NativeAdreno ABI v2 bridge
+
+Expose UniXNU's fixed-size NativeAdreno ABI through the existing
+IOAcceleratorES user client when it is opened with type 0x4147.  The old
+SweetMetal scalar selectors remain byte-for-byte compatible.
+
+The bridge keeps per-client ownership for contiguous BOs, maps client-chosen
+IOVAs in a dedicated 128-256 GB window, exposes CPU-map leases and metadata,
+and submits indirect buffers through the same synchronous CP path already
+proven by the display blitter.  Hardware imports are deliberately not
+advertised until IOSurface task-page pinning is implemented.
+
+A separate sweetadreno=1 boot switch publishes the service without publishing
+MetalPluginName, so the NativeAdreno path can be tested while CoreAnimation
+continues to use its working CPU renderer.
+---
+ iokit/Kernel/arm/SweetAccelerator.cpp |  22 ++
+ bsd/dev/sweet_accel_client.cpp        | 345 +++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_a6xx_host.c             | 344 +++++++++++++++++++++++++++++++++
+ bsd/dev/sweet_native_abi.h            | 192 ++++++++++++++++++
+ 4 files changed, 896 insertions(+), 7 deletions(-)
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+index c87d709..53e1d9a 100644
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -44,13 +44,17 @@ OSDefineMetaClassAndStructors(SweetAccelerator, IOAcceleratorES);
+ static SweetAccelerator *g_accel;
+ static char g_plugin[96] = "SweetMetal";
+ static char g_pending[96];
++static bool g_metal_enabled;
+ 
+ IOService *
+ SweetAccelerator::probe(IOService *provider, SInt32 *score)
+ {
+ 	uint32_t on = 0;
++	uint32_t native = 0;
+ 	PE_parse_boot_argn("sweetmtl", &on, sizeof(on));
+-	return on ? IOService::probe(provider, score) : NULL;
++	PE_parse_boot_argn("sweetadreno", &native, sizeof(native));
++	g_metal_enabled = on != 0;
++	return (on || native) ? IOService::probe(provider, score) : NULL;
+ }
+ 
+ bool
+@@ -67,15 +71,18 @@ SweetAccelerator::start(IOService *provider)
+ 	if (!PE_parse_boot_argn("sweetmtlname", plugin, sizeof(plugin)) || plugin[0] == 0) {
+ 		strlcpy(plugin, "SweetMetal", sizeof(plugin));
+ 	}
+-	setProperty("MetalPluginName", plugin);
+-	setProperty("MetalPluginClassName", "SweetMTLDevice");
+-	setProperty("IOGLBundleName", plugin);
++	if (g_metal_enabled) {
++		setProperty("MetalPluginName", plugin);
++		setProperty("MetalPluginClassName", "SweetMTLDevice");
++		setProperty("IOGLBundleName", plugin);
++	}
+ 	setProperty("model", "Adreno 640");
+ 	registerService();
+-	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s)\n", plugin);
++	IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName %s, NativeAdreno ABI %s)\n",
++	    g_metal_enabled ? plugin : "off", "v2");
+ 	g_accel = this;
+ 	/* The overlay may have run before this service existed; replay its ask. */
+-	if (g_pending[0] != 0) {
++	if (g_metal_enabled && g_pending[0] != 0) {
+ 		strlcpy(g_plugin, g_pending, sizeof(g_plugin));
+ 		setProperty("MetalPluginName", g_plugin);
+ 		setProperty("IOGLBundleName", g_plugin);
+@@ -105,6 +112,9 @@ sweet_metal_plugin_set(const char *name)
+ 		/* Not started yet: start() replays g_pending. */
+ 		return;
+ 	}
++	if (!g_metal_enabled) {
++		return;
++	}
+ 	strlcpy(g_plugin, name, sizeof(g_plugin));
+ 	g_accel->setProperty("MetalPluginName", g_plugin);
+ 	g_accel->setProperty("IOGLBundleName", g_plugin);
+
+diff --git a/bsd/dev/sweet_accel_client.cpp b/bsd/dev/sweet_accel_client.cpp
+index 3754966..310b52a 100644
+--- a/bsd/dev/sweet_accel_client.cpp
++++ b/bsd/dev/sweet_accel_client.cpp
+@@ -31,6 +31,7 @@
+  * directory finds a bare "SweetSurface.h". Keep it relative rather than adding
+  * an include path to the kernel build. */
+ #include "../../iokit/Kernel/arm/SweetSurface.h"
++#include "sweet_native_abi.h"
+ 
+ extern "C" {
+ int sweet_a6xx_bo_alloc(uint64_t size, uint64_t *h, uint64_t *gpu_va, uint64_t *sz);
+@@ -42,6 +43,26 @@ int sweet_a6xx_bo_cache_flush(uint64_t h, uint64_t off, uint64_t len);
+ int sweet_a6xx_surface_import_pages(uint32_t id, const uint64_t *pages, uint32_t npages,
+     uint64_t *gpu_va, uint64_t *size);
+ bool sweet_gpu_ready(void);
++uint64_t sweet_a6xx_native_open(void);
++void sweet_a6xx_native_close(uint64_t owner);
++int sweet_a6xx_native_bo_alloc(uint64_t owner, uint64_t size, uint32_t align_log2,
++    uint32_t contiguous, uint64_t *out_handle);
++int sweet_a6xx_native_bo_map(uint64_t owner, uint64_t handle, uint64_t iova,
++    uint32_t permissions, uint32_t writeback, uint32_t shareability);
++int sweet_a6xx_native_bo_free(uint64_t owner, uint64_t handle);
++int sweet_a6xx_native_bo_cpu_map(uint64_t owner, uint64_t handle, uint32_t *token,
++    uint64_t *size);
++int sweet_a6xx_native_bo_cpu_unmap(uint64_t owner, uint64_t handle, uint32_t token);
++int sweet_a6xx_native_bo_info(uint64_t owner, uint32_t token, vm_offset_t *kva,
++    uint64_t *size);
++int sweet_a6xx_native_submit(uint64_t owner, const struct SweetNativeSubmit *request,
++    uint32_t *out_fence);
++int sweet_a6xx_native_wait_fence(uint64_t fence, uint64_t timeout_ns);
++uint64_t sweet_a6xx_native_timestamp(void);
++int sweet_a6xx_native_set_metadata(uint64_t owner, uint64_t handle,
++    const void *bytes, uint32_t size);
++int sweet_a6xx_native_get_metadata(uint64_t owner, uint64_t handle,
++    void *bytes, uint32_t capacity, uint32_t *out_size);
+ }
+ 
+ extern "C" IOService *sweet_accel_create_user_client(IOService *provider,
+@@ -54,6 +75,9 @@ class SweetAcceleratorClient : public IOUserClient {
+ 	IOReturn exportObjectToClient(task_t, OSObject *, ipc_port_t *) APPLE_KEXT_OVERRIDE;
+ 
+ 	IOService *fProvider;
++	UInt32 fOpenType;
++	uint64_t fAbiOwner;
++	uint64_t fQueueMask;
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type,
+@@ -62,6 +86,7 @@ public:
+ 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 
++	IOReturn nativeExternalMethod(uint32_t selector, IOExternalMethodArguments *args);
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
+@@ -84,6 +109,9 @@ SweetAcceleratorClient::initWithTask(task_t owningTask, void *securityID, UInt32
+ 		return false;
+ 	}
+ 	fProvider = NULL;
++	fOpenType = type;
++	fAbiOwner = 0;
++	fQueueMask = 1;
+ 	return true;
+ }
+ 
+@@ -94,6 +122,13 @@ SweetAcceleratorClient::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fProvider = provider;
++	if ((fOpenType & 0xffff0000U) == 0x41470000U || fOpenType == 0x4147) {
++		fAbiOwner = sweet_a6xx_native_open();
++		if (fAbiOwner == 0) {
++			return false;
++		}
++		IOLog("SWEET MTL: NativeAdreno ABI v2 client opened (type 0x%x)\n", fOpenType);
++	}
+ 	IOLog("SWEET MTL: user client opened\n");
+ 	return true;
+ }
+@@ -102,6 +137,10 @@ void
+ SweetAcceleratorClient::stop(IOService *provider)
+ {
+ 	IOUserClient::stop(provider);
++	if (fAbiOwner) {
++		sweet_a6xx_native_close(fAbiOwner);
++		fAbiOwner = 0;
++	}
+ 	fProvider = NULL;
+ }
+ 
+@@ -125,6 +164,9 @@ SweetAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArgume
+ 	if (args == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (fAbiOwner != 0) {
++		return nativeExternalMethod(selector, args);
++	}
+ 	if (!sweet_gpu_ready() && selector != 0) {
+ 		return kIOReturnNotReady;
+ 	}
+@@ -236,6 +278,304 @@ SweetAcceleratorClient::externalMethod(uint32_t selector, IOExternalMethodArgume
+ 	}
+ }
+ 
++static bool
++nativeSizes(uint32_t selector, size_t *input, size_t *output)
++{
++	switch (selector) {
++	case SweetNativeMethodQuery:
++	case SweetNativeMethodGetTimestamp:
++	case SweetNativeMethodGetStatus:
++	case SweetNativeMethodGetDeviceInfo:
++		*input = 0;
++		break;
++	case SweetNativeMethodBoAlloc:
++		*input = sizeof(struct SweetNativeBoAlloc);
++		break;
++	case SweetNativeMethodBoMap:
++		*input = sizeof(struct SweetNativeBoMap);
++		break;
++	case SweetNativeMethodBoImport:
++		*input = sizeof(struct SweetNativeBoImport);
++		break;
++	case SweetNativeMethodBoFree:
++		*input = sizeof(struct SweetNativeBoFree);
++		break;
++	case SweetNativeMethodSubmit:
++		*input = sizeof(struct SweetNativeSubmit);
++		break;
++	case SweetNativeMethodSetMetadata:
++	case SweetNativeMethodGetMetadata:
++		*input = sizeof(struct SweetNativeMetadata);
++		break;
++	case SweetNativeMethodCreateQueue:
++	case SweetNativeMethodCloseQueue:
++		*input = sizeof(struct SweetNativeQueue);
++		break;
++	case SweetNativeMethodBoCpuMap:
++		*input = sizeof(struct SweetNativeBoCpuMap);
++		break;
++	case SweetNativeMethodBoCpuUnmap:
++		*input = sizeof(struct SweetNativeBoCpuUnmap);
++		break;
++	case SweetNativeMethodWaitFence:
++		*input = sizeof(struct SweetNativeWaitFence);
++		break;
++	case SweetNativeMethodSetPriority:
++		*input = sizeof(struct SweetNativePriority);
++		break;
++	case SweetNativeMethodNote:
++		*input = sizeof(struct SweetNativeNote);
++		break;
++	default:
++		return false;
++	}
++
++	switch (selector) {
++	case SweetNativeMethodQuery:
++		*output = sizeof(struct SweetNativeParams);
++		break;
++	case SweetNativeMethodBoAlloc:
++	case SweetNativeMethodBoImport:
++		*output = sizeof(struct SweetNativeBoAllocReply);
++		break;
++	case SweetNativeMethodBoMap:
++		*output = sizeof(struct SweetNativeBoMapReply);
++		break;
++	case SweetNativeMethodSubmit:
++		*output = sizeof(struct SweetNativeSubmitReply);
++		break;
++	case SweetNativeMethodGetTimestamp:
++		*output = sizeof(struct SweetNativeTimestamp);
++		break;
++	case SweetNativeMethodGetStatus:
++		*output = sizeof(struct SweetNativeStatus);
++		break;
++	case SweetNativeMethodGetDeviceInfo:
++		*output = sizeof(struct SweetNativeDeviceInfo);
++		break;
++	case SweetNativeMethodGetMetadata:
++		*output = sizeof(struct SweetNativeMetadata);
++		break;
++	case SweetNativeMethodCreateQueue:
++		*output = sizeof(struct SweetNativeQueueReply);
++		break;
++	case SweetNativeMethodBoCpuMap:
++		*output = sizeof(struct SweetNativeBoCpuMapReply);
++		break;
++	case SweetNativeMethodBoFree:
++	case SweetNativeMethodWaitFence:
++	case SweetNativeMethodSetMetadata:
++	case SweetNativeMethodCloseQueue:
++	case SweetNativeMethodBoCpuUnmap:
++	case SweetNativeMethodSetPriority:
++	case SweetNativeMethodNote:
++		*output = 0;
++		break;
++	default:
++		return false;
++	}
++	return true;
++}
++
++IOReturn
++SweetAcceleratorClient::nativeExternalMethod(uint32_t selector, IOExternalMethodArguments *args)
++{
++	size_t input_size = 0, output_size = 0;
++	if (!nativeSizes(selector, &input_size, &output_size) ||
++	    args->structureInputSize != input_size ||
++	    args->structureOutputSize != output_size ||
++	    (input_size && args->structureInput == NULL) ||
++	    (output_size && args->structureOutput == NULL)) {
++		return kIOReturnBadArgument;
++	}
++	const void *input = args->structureInput;
++	void *output = args->structureOutput;
++	if (selector != SweetNativeMethodQuery && !sweet_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++
++	switch (selector) {
++	case SweetNativeMethodQuery: {
++		struct SweetNativeParams reply = {};
++		reply.abi_version = SweetNativeAbiVersion;
++		reply.input_bits = 39;
++		reply.output_bits = 40;
++		reply.flags = 0;
++		reply.max_bo_bytes = 0x20000000ULL;
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodGetDeviceInfo: {
++		struct SweetNativeDeviceInfo reply = {};
++		reply.chip_id = 0x06040001;
++		reply.gmem_bytes = 512 * 1024;
++		reply.gmem_base = 0;
++		reply.uche_trap_base = 0x1fffffffff000ULL;
++		reply.va_start = 0x2000000000ULL;
++		reply.va_size = 0x1000000000ULL;
++		reply.highest_bank_bit = 14;
++		reply.ubwc_swizzle = 6;
++		reply.macrotile_mode = 1;
++		reply.ubwc_version = 3;
++		reply.flags = SweetNativeDeviceClientIova;
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoAlloc: {
++		const struct SweetNativeBoAlloc *request =
++		    (const struct SweetNativeBoAlloc *)input;
++		struct SweetNativeBoAllocReply reply = {};
++		if (sweet_a6xx_native_bo_alloc(fAbiOwner, request->bytes,
++		    request->align_log2, request->contiguous, &reply.handle)) {
++			return kIOReturnNoMemory;
++		}
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoMap: {
++		const struct SweetNativeBoMap *request =
++		    (const struct SweetNativeBoMap *)input;
++		struct SweetNativeBoMapReply reply = {};
++		if (request->reserved ||
++		    sweet_a6xx_native_bo_map(fAbiOwner, request->handle, request->iova,
++		    request->permissions, request->writeback, request->shareability)) {
++			return kIOReturnBadArgument;
++		}
++		reply.iova = request->iova;
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoFree: {
++		const struct SweetNativeBoFree *request =
++		    (const struct SweetNativeBoFree *)input;
++		return sweet_a6xx_native_bo_free(fAbiOwner, request->handle) ?
++		    kIOReturnBadArgument : kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoCpuMap: {
++		const struct SweetNativeBoCpuMap *request =
++		    (const struct SweetNativeBoCpuMap *)input;
++		struct SweetNativeBoCpuMapReply reply = {};
++		if (sweet_a6xx_native_bo_cpu_map(fAbiOwner, request->handle,
++		    &reply.token, &reply.bytes)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoCpuUnmap: {
++		const struct SweetNativeBoCpuUnmap *request =
++		    (const struct SweetNativeBoCpuUnmap *)input;
++		if (request->reserved ||
++		    sweet_a6xx_native_bo_cpu_unmap(fAbiOwner, request->handle,
++		    request->token)) {
++			return kIOReturnBadArgument;
++		}
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodSubmit: {
++		const struct SweetNativeSubmit *request =
++		    (const struct SweetNativeSubmit *)input;
++		struct SweetNativeSubmitReply reply = {};
++		if (request->queue >= 64 ||
++		    (request->queue != 0 && !(fQueueMask & (1ULL << request->queue)))) {
++			return kIOReturnBadArgument;
++		}
++		if (sweet_a6xx_native_submit(fAbiOwner, request, (uint32_t *)&reply.fence)) {
++			return kIOReturnError;
++		}
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodWaitFence: {
++		const struct SweetNativeWaitFence *request =
++		    (const struct SweetNativeWaitFence *)input;
++		return sweet_a6xx_native_wait_fence(request->fence, request->timeout_ns) ?
++		    kIOReturnTimeout : kIOReturnSuccess;
++	}
++	case SweetNativeMethodGetTimestamp: {
++		struct SweetNativeTimestamp reply = {};
++		reply.ticks = sweet_a6xx_native_timestamp();
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodGetStatus: {
++		struct SweetNativeStatus reply = {};
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodSetMetadata: {
++		const struct SweetNativeMetadata *request =
++		    (const struct SweetNativeMetadata *)input;
++		if (request->reserved || request->bytes > SweetNativeMetadataBytes ||
++		    sweet_a6xx_native_set_metadata(fAbiOwner, request->handle,
++		    request->text, request->bytes)) {
++			return kIOReturnBadArgument;
++		}
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodGetMetadata: {
++		const struct SweetNativeMetadata *request =
++		    (const struct SweetNativeMetadata *)input;
++		struct SweetNativeMetadata reply = {};
++		uint32_t got = 0;
++		if (request->reserved ||
++		    sweet_a6xx_native_get_metadata(fAbiOwner, request->handle,
++		    reply.text, request->bytes, &got)) {
++			return kIOReturnBadArgument;
++		}
++		reply.handle = request->handle;
++		reply.bytes = got;
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodCreateQueue: {
++		struct SweetNativeQueueReply reply = {};
++		for (uint32_t q = 1; q < 64; q++) {
++			if (!(fQueueMask & (1ULL << q))) {
++				fQueueMask |= 1ULL << q;
++				reply.queue = q;
++				break;
++			}
++		}
++		if (reply.queue == 0) {
++			return kIOReturnNoResources;
++		}
++		memcpy(output, &reply, sizeof(reply));
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodCloseQueue: {
++		const struct SweetNativeQueue *request =
++		    (const struct SweetNativeQueue *)input;
++		if (request->queue == 0 || request->queue >= 64 ||
++		    !(fQueueMask & (1ULL << request->queue))) {
++			return kIOReturnBadArgument;
++		}
++		fQueueMask &= ~(1ULL << request->queue);
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodSetPriority: {
++		const struct SweetNativePriority *request =
++		    (const struct SweetNativePriority *)input;
++		if (request->foreground > 5 || request->background > 5) {
++			return kIOReturnBadArgument;
++		}
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodNote: {
++		const struct SweetNativeNote *request =
++		    (const struct SweetNativeNote *)input;
++		if (request->count > SweetNativeNoteWords) {
++			return kIOReturnBadArgument;
++		}
++		return kIOReturnSuccess;
++	}
++	case SweetNativeMethodBoImport:
++		return kIOReturnUnsupported;
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
+ IOReturn
+ SweetAcceleratorClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+     IOMemoryDescriptor **memory)
+@@ -246,7 +586,10 @@ SweetAcceleratorClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+ 	if (memory == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (sweet_a6xx_bo_info((uint64_t)type, &kva, &size) || kva == 0 || size == 0) {
++	int rc = fAbiOwner ?
++	    sweet_a6xx_native_bo_info(fAbiOwner, type, &kva, &size) :
++	    sweet_a6xx_bo_info((uint64_t)type, &kva, &size);
++	if (rc || kva == 0 || size == 0) {
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddress((void *)kva, (IOByteCount)size,
+
+diff --git a/bsd/dev/sweet_a6xx_host.c b/bsd/dev/sweet_a6xx_host.c
+index ac76a36..f58b692 100644
+--- a/bsd/dev/sweet_a6xx_host.c
++++ b/bsd/dev/sweet_a6xx_host.c
+@@ -38,6 +38,7 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
+ #include "sweet_a6xx.h"
++#include "sweet_native_abi.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern boolean_t pmap_valid_address(uint64_t pa);
+@@ -1011,4 +1012,347 @@ sweet_a6xx_bo_cache_flush(uint64_t handle, uint64_t offset, uint64_t len)
+ 	return 0;
+ }
+ 
++/* ======================================================================
++ * NativeAdreno ABI v2 BO and submission bridge.
++ *
++ * Turnip allocates and maps many short-lived buffers.  Keep this state
++ * separate from the four display slots and the small SweetMetal BO table so
++ * either userland path can run without changing the other's contract.
++ * ====================================================================== */
++
++#define NATIVE_MAX_BO		4096
++#define NATIVE_VA_BASE		0x2000000000ULL	/* 128 GB */
++#define NATIVE_VA_SIZE		0x1000000000ULL	/* 64 GB, below the 39-bit limit */
++#define NATIVE_MAX_BO_BYTES	0x20000000ULL	/* 512 MiB per allocation */
++
++struct sweet_native_bo {
++	uint64_t owner;
++	uint64_t size;
++	uint64_t pa;
++	uint64_t iova;
++	vm_offset_t kva;
++	uint32_t leases;
++	uint8_t metadata[64];
++	bool used;
++	bool mapped;
++	bool metadata_set;
++};
++
++static struct sweet_native_bo native_bos[NATIVE_MAX_BO];
++static uint64_t native_next_owner;
++int a6_unmap_pages(struct a6_gpu *g, uint64_t iova, uint32_t npages, uint32_t page_size);
++
++static struct sweet_native_bo *
++native_bo(uint64_t owner, uint64_t handle)
++{
++	if (owner == 0 || handle == 0 || handle > NATIVE_MAX_BO) {
++		return NULL;
++	}
++	struct sweet_native_bo *b = &native_bos[handle - 1];
++	return b->used && b->owner == owner ? b : NULL;
++}
++
++static void
++native_bo_destroy(struct sweet_native_bo *b)
++{
++	if (b->mapped) {
++		(void)a6_unmap_pages(&gpu, b->iova, (uint32_t)(b->size >> PAGE_SHIFT),
++		    PAGE_SIZE);
++	}
++	if (b->kva) {
++		kmem_free(kernel_map, b->kva, (vm_size_t)b->size);
++	}
++	memset(b, 0, sizeof(*b));
++}
++
++uint64_t
++sweet_a6xx_native_open(void)
++{
++	uint64_t owner;
++	lck_mtx_lock(&sweet_a6xx_lock);
++	do {
++		owner = ++native_next_owner;
++	} while (owner == 0);
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return owner;
++}
++
++void
++sweet_a6xx_native_close(uint64_t owner)
++{
++	if (owner == 0) {
++		return;
++	}
++	lck_mtx_lock(&sweet_a6xx_lock);
++	for (int i = 0; i < NATIVE_MAX_BO; i++) {
++		if (native_bos[i].used && native_bos[i].owner == owner) {
++			native_bo_destroy(&native_bos[i]);
++		}
++	}
++	lck_mtx_unlock(&sweet_a6xx_lock);
++}
++
++int
++sweet_a6xx_native_bo_alloc(uint64_t owner, uint64_t size, uint32_t align_log2,
++    uint32_t contiguous, uint64_t *out_handle)
++{
++	if (!gpu_ready || owner == 0 || out_handle == NULL ||
++	    size == 0 || (size & PAGE_MASK) || size > NATIVE_MAX_BO_BYTES ||
++	    align_log2 < PAGE_SHIFT || align_log2 > 24 || contiguous > 1) {
++		return -1;
++	}
++
++	lck_mtx_lock(&sweet_a6xx_lock);
++	int slot = -1;
++	for (int i = 0; i < NATIVE_MAX_BO; i++) {
++		if (!native_bos[i].used) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot < 0) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++
++	vm_offset_t kva = 0;
++	vm_size_t align = ((vm_size_t)1 << align_log2) - 1;
++	if (kmem_alloc_contig(kernel_map, &kva, (vm_size_t)size, align, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (pn == 0) {
++		kmem_free(kernel_map, kva, (vm_size_t)size);
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++
++	struct sweet_native_bo *b = &native_bos[slot];
++	memset(b, 0, sizeof(*b));
++	b->owner = owner;
++	b->size = size;
++	b->kva = kva;
++	b->pa = ptoa_64(pn);
++	b->used = true;
++	*out_handle = (uint64_t)slot + 1;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_bo_map(uint64_t owner, uint64_t handle, uint64_t iova,
++    uint32_t permissions, uint32_t writeback, uint32_t shareability)
++{
++	if (!(permissions & 1) || (permissions & ~3u) || writeback > 1 ||
++	    (shareability != 2 && shareability != 3) || (iova & PAGE_MASK)) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL || b->mapped || iova < NATIVE_VA_BASE ||
++	    iova - NATIVE_VA_BASE >= NATIVE_VA_SIZE ||
++	    b->size > NATIVE_VA_BASE + NATIVE_VA_SIZE - iova ||
++	    a6_map(&gpu, iova, b->pa, b->size)) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	if (a6_tlb_flush(&gpu)) {
++		(void)a6_unmap_pages(&gpu, iova, (uint32_t)(b->size >> PAGE_SHIFT),
++		    PAGE_SIZE);
++		(void)a6_tlb_flush(&gpu);
++		gpu_ready = false;
++		a6_log("native map: TLB invalidation timed out; GPU disabled\n");
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	b->iova = iova;
++	b->mapped = true;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_bo_free(uint64_t owner, uint64_t handle)
++{
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL || b->leases != 0) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	native_bo_destroy(b);
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_bo_cpu_map(uint64_t owner, uint64_t handle, uint32_t *token,
++    uint64_t *size)
++{
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL || b->leases != 0 || token == NULL || size == NULL) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	b->leases = 1;
++	*token = (uint32_t)handle;
++	*size = b->size;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_bo_cpu_unmap(uint64_t owner, uint64_t handle, uint32_t token)
++{
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL || b->leases == 0 || token != (uint32_t)handle) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	b->leases = 0;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_bo_info(uint64_t owner, uint32_t token, vm_offset_t *kva,
++    uint64_t *size)
++{
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, token);
++	if (b == NULL || b->leases == 0 || kva == NULL || size == NULL) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	*kva = b->kva;
++	*size = b->size;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++static void
++native_bo_flush(struct sweet_native_bo *b)
++{
++	flush_dcache64((addr64_t)b->pa, (unsigned)b->size, TRUE);
++}
++
++int sweet_a6xx_native_wait_fence(uint64_t fence, uint64_t timeout_ns);
++
++int
++sweet_a6xx_native_submit(uint64_t owner, const struct SweetNativeSubmit *request,
++    uint32_t *out_fence)
++{
++	if (!gpu_ready || owner == 0 || request == NULL || out_fence == NULL ||
++	    request->buffer_count == 0 ||
++	    request->buffer_count > SweetNativeAbiMaxBuffers || request->reserved) {
++		return -1;
++	}
++	if (request->wait_fence &&
++	    sweet_a6xx_native_wait_fence(request->wait_fence, request->wait_timeout_ns)) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_a6xx_lock);
++	for (uint32_t i = 0; i < request->buffer_count; i++) {
++		const struct SweetNativeSubmitBuffer *wire = &request->buffers[i];
++		struct sweet_native_bo *b = native_bo(owner, wire->handle);
++		uint64_t dwords = wire->bytes / 4;
++		if (b == NULL || !b->mapped || wire->bytes == 0 ||
++		    (wire->bytes & 3) || dwords > 0xfffff ||
++		    wire->iova < b->iova ||
++		    wire->iova - b->iova > b->size ||
++		    wire->bytes > b->size - (wire->iova - b->iova)) {
++			lck_mtx_unlock(&sweet_a6xx_lock);
++			return -1;
++		}
++		native_bo_flush(b);
++	}
++	for (uint32_t i = 0; i < request->buffer_count; i++) {
++		const struct SweetNativeSubmitBuffer *wire = &request->buffers[i];
++		if (a6_submit_ib(&gpu, wire->iova, (uint32_t)(wire->bytes / 4), 500)) {
++			uint64_t far = 0;
++			uint32_t syn = 0, fsr = a6_fault_status(&gpu, &far, &syn);
++			a6_log("native submit: timeout (fence %u, buffer %u, smmu fsr %x far %llx)\n",
++			    gpu.fence, i, fsr, far);
++			(void)a6_clear_fault(&gpu);
++			gpu_diag_dma_unsafe = true;
++			gpu_ready = false;
++			lck_mtx_unlock(&sweet_a6xx_lock);
++			return -1;
++		}
++	}
++	*out_fence = gpu.fence;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_wait_fence(uint64_t fence, uint64_t timeout_ns)
++{
++	if (fence == 0 || fence > gpu.fence) {
++		return -1;
++	}
++	if (a6_fence_read(&gpu) >= fence) {
++		return 0;
++	}
++	uint64_t ms = timeout_ns / 1000000;
++	if (ms > 60000) {
++		ms = 60000;
++	}
++	return sweet_a6xx_wait_fence((uint32_t)fence, (uint32_t)ms);
++}
++
++uint64_t
++sweet_a6xx_native_timestamp(void)
++{
++	uint64_t lo = a6_rd(A6_GREG(0x980));
++	uint64_t hi = a6_rd(A6_GREG(0x981));
++	return lo | (hi << 32);
++}
++
++int
++sweet_a6xx_native_set_metadata(uint64_t owner, uint64_t handle,
++    const void *bytes, uint32_t size)
++{
++	if (bytes == NULL || size > sizeof(((struct sweet_native_bo *)0)->metadata)) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	memcpy(b->metadata, bytes, size);
++	b->metadata_set = true;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++int
++sweet_a6xx_native_get_metadata(uint64_t owner, uint64_t handle,
++    void *bytes, uint32_t capacity, uint32_t *out_size)
++{
++	if (bytes == NULL || out_size == NULL) {
++		return -1;
++	}
++	lck_mtx_lock(&sweet_a6xx_lock);
++	struct sweet_native_bo *b = native_bo(owner, handle);
++	if (b == NULL || !b->metadata_set) {
++		lck_mtx_unlock(&sweet_a6xx_lock);
++		return -1;
++	}
++	uint32_t size = capacity < sizeof(b->metadata) ? capacity : sizeof(b->metadata);
++	memcpy(bytes, b->metadata, size);
++	*out_size = size;
++	lck_mtx_unlock(&sweet_a6xx_lock);
++	return 0;
++}
++
++
+ #endif /* ARM64_BOARD_CONFIG_GUACAMOLE */
++
++
+
+diff --git a/bsd/dev/sweet_native_abi.h b/bsd/dev/sweet_native_abi.h
+new file mode 100644
+index 0000000..2f8aa44
+--- /dev/null
++++ b/bsd/dev/sweet_native_abi.h
+@@ -0,0 +1,192 @@
++/*
++ * NativeAdreno ABI v2, wire-compatible with UniXNU/NativeAdreno.
++ *
++ * This is a fixed-size IOKit structure-method ABI, not an ioctl ABI.  The
++ * SweetMetal 0..7 scalar contract remains separate and unchanged.  We keep
++ * the public record names and values identical so an unmodified Turnip
++ * Darwin backend can talk to this service.
++ */
++#ifndef SWEET_NATIVE_ABI_H
++#define SWEET_NATIVE_ABI_H
++
++#include <stdint.h>
++
++enum {
++	SweetNativeAbiVersion = 2,
++	SweetNativeAbiMaxBuffers = 128,
++	SweetNativeMethodQuery = 1,
++	SweetNativeMethodBoAlloc = 2,
++	SweetNativeMethodBoMap = 3,
++	SweetNativeMethodBoFree = 4,
++	SweetNativeMethodSubmit = 5,
++	SweetNativeMethodWaitFence = 6,
++	SweetNativeMethodGetTimestamp = 7,
++	SweetNativeMethodGetStatus = 8,
++	SweetNativeMethodSetMetadata = 9,
++	SweetNativeMethodGetMetadata = 10,
++	SweetNativeMethodCreateQueue = 11,
++	SweetNativeMethodCloseQueue = 12,
++	SweetNativeMethodBoCpuMap = 13,
++	SweetNativeMethodBoCpuUnmap = 14,
++	SweetNativeMethodGetDeviceInfo = 15,
++	SweetNativeMethodBoImport = 16,
++	SweetNativeMethodSetPriority = 17,
++	SweetNativeMethodNote = 18,
++	SweetNativeMetadataBytes = 64,
++	SweetNativeNoteWords = 30
++};
++
++struct SweetNativeParams {
++	uint32_t abi_version;
++	uint32_t input_bits;
++	uint32_t output_bits;
++	uint32_t flags;
++	uint64_t max_bo_bytes;
++};
++
++enum {
++	SweetNativeParamsHostImport = 1,
++	SweetNativeParamsOwnedCoherent = 2,
++	SweetNativeParamsMemoryPressure = 4
++};
++
++struct SweetNativeBoAlloc {
++	uint64_t bytes;
++	uint32_t align_log2;
++	uint32_t contiguous;
++};
++
++struct SweetNativeBoAllocReply {
++	uint64_t handle;
++};
++
++struct SweetNativeBoImport {
++	uint64_t address;
++	uint64_t bytes;
++};
++
++struct SweetNativeBoMap {
++	uint64_t handle;
++	uint64_t iova;
++	uint32_t permissions;
++	uint32_t writeback;
++	uint32_t shareability;
++	uint32_t reserved;
++};
++
++struct SweetNativeBoMapReply {
++	uint64_t iova;
++};
++
++struct SweetNativeBoFree {
++	uint64_t handle;
++};
++
++struct SweetNativeSubmitBuffer {
++	uint64_t handle;
++	uint64_t iova;
++	uint64_t bytes;
++};
++
++struct SweetNativeSubmit {
++	uint32_t buffer_count;
++	uint32_t reserved;
++	uint64_t queue;
++	uint64_t wait_fence;
++	uint64_t wait_timeout_ns;
++	struct SweetNativeSubmitBuffer buffers[SweetNativeAbiMaxBuffers];
++};
++
++struct SweetNativeMetadata {
++	uint64_t handle;
++	uint32_t bytes;
++	uint32_t reserved;
++	char text[SweetNativeMetadataBytes];
++};
++
++struct SweetNativeSubmitReply {
++	uint64_t fence;
++};
++
++struct SweetNativeWaitFence {
++	uint64_t fence;
++	uint64_t timeout_ns;
++};
++
++struct SweetNativeTimestamp {
++	uint64_t ticks;
++};
++
++struct SweetNativeBoCpuMap {
++	uint64_t handle;
++};
++
++struct SweetNativeBoCpuMapReply {
++	uint32_t token;
++	uint32_t reserved;
++	uint64_t bytes;
++};
++
++struct SweetNativeBoCpuUnmap {
++	uint64_t handle;
++	uint32_t token;
++	uint32_t reserved;
++};
++
++struct SweetNativePriority {
++	uint32_t foreground;
++	uint32_t background;
++};
++
++struct SweetNativeNote {
++	uint32_t kind;
++	uint32_t count;
++	uint32_t words[SweetNativeNoteWords];
++};
++
++struct SweetNativeQueue {
++	uint64_t queue;
++};
++
++struct SweetNativeQueueReply {
++	uint64_t queue;
++};
++
++struct SweetNativeStatus {
++	uint64_t faults;
++	uint64_t suspends;
++};
++
++enum {
++	SweetNativeDeviceClientIova = 1,
++	SweetNativeDeviceCachedCoherent = 2
++};
++
++struct SweetNativeDeviceInfo {
++	uint32_t chip_id;
++	uint32_t gmem_bytes;
++	uint64_t gmem_base;
++	uint64_t uche_trap_base;
++	uint64_t va_start;
++	uint64_t va_size;
++	uint32_t highest_bank_bit;
++	uint32_t ubwc_swizzle;
++	uint32_t macrotile_mode;
++	uint32_t ubwc_version;
++	uint32_t flags;
++	uint32_t reserved;
++};
++
++#ifdef __cplusplus
++static_assert(sizeof(struct SweetNativeParams) == 24, "NativeAdreno params ABI");
++static_assert(sizeof(struct SweetNativeBoAlloc) == 16, "NativeAdreno alloc ABI");
++static_assert(sizeof(struct SweetNativeBoMap) == 32, "NativeAdreno map ABI");
++static_assert(sizeof(struct SweetNativeSubmit) == 32 + 24 * SweetNativeAbiMaxBuffers,
++    "NativeAdreno submit ABI");
++static_assert(sizeof(struct SweetNativeMetadata) == 80, "NativeAdreno metadata ABI");
++static_assert(sizeof(struct SweetNativeBoCpuMapReply) == 16, "NativeAdreno cpu-map ABI");
++static_assert(sizeof(struct SweetNativeBoCpuUnmap) == 16, "NativeAdreno cpu-unmap ABI");
++static_assert(sizeof(struct SweetNativeDeviceInfo) == 64, "NativeAdreno device-info ABI");
++#endif
++
++#endif /* SWEET_NATIVE_ABI_H */
+
