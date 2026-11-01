@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -61,3 +61,6 @@
+ extern "C" int sweet_console_quarantined;
++extern "C" void sweet_gpu_draw_status(uintptr_t address, uint32_t width, uint32_t height,
++    uint32_t stride, uint64_t bytes, uint64_t gpu_frames, uint64_t cpu_frames);
++
+ 
+ #define SWEET_FB_GPU_MAX_PAGES          (0x1200000u / PAGE_SIZE)
+@@ -163,3 +166,5 @@
+ 	bool          fGpuQuarantined;
++	bool          fGpuStatus;
++	uint64_t      fGpuPresents, fCpuPresents;
+ 	SweetSurface *fGpuQuarantinedSurface; /* retained while the CP may still read it */
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+@@ -180,2 +185,3 @@
+ 	void present(const uint8_t *rec);
++	void drawGpuStatus();
+ };
+@@ -248,3 +254,8 @@
+ 	fGpuQuarantinedSurface = NULL;
++	fGpuPresents = fCpuPresents = 0;
++	uint32_t status = 0;
++	fGpuStatus = PE_parse_boot_argn("sweetfb_gpustat", &status, sizeof(status)) && status != 0;
++	IOLog("SWEET FB: A640 status overlay %s\n", fGpuStatus ? "requested" : "disabled");
++
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -386,2 +397,13 @@
+ void
++AppleCLCD::drawGpuStatus()
++{
++	if (fGpuStatus && !fGpuQuarantined && !sweet_console_quarantined &&
++	    !fPowerOff && sweet_console_muted && fMap != NULL &&
++	    fPhys == 0x9c000000ULL && fWidth == 1440 && fHeight == 3120 && fRowBytes == 5760) {
++		sweet_gpu_draw_status(fPixels, fWidth, fHeight, fRowBytes,
++		    (uint64_t)fMap->getLength(), fGpuPresents, fCpuPresents);
++	}
++}
++
++void
+ AppleCLCD::present(const uint8_t *rec)
+@@ -389,3 +411,4 @@
+ 	uint32_t mask = get32(rec, 0x104);
++	bool cpu_copied = false;
+ 
+ 	if (fGpuQuarantined) {
+@@ -485,3 +508,5 @@
+ 				if (gpu_rc == 0) {
++					fGpuPresents++;
++					drawGpuStatus();
+ 					s->release();
+ 					return;
+@@ -568,2 +593,3 @@
+ 				if (dw > 0 && dh > 0) {
++					cpu_copied = true;
+ 					for (int32_t x = 0; x < dw; x++) {
+@@ -591,2 +617,3 @@
+ 			} else {
++				cpu_copied = true;
+ 				for (int32_t y = 0; y < h; y++) {
+@@ -608,6 +635,10 @@
+ 		s->release();
+ 	}
++	if (cpu_copied) {
++		fCpuPresents++;
++		drawGpuStatus();
++	}
+ }
+ 
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)

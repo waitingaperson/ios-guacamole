@@ -1,0 +1,11 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -547,6 +547,6 @@ ud_setup(void)
+ 			break;
+ 		case 0x22:              /* SET_CONTROL_LINE_STATE: bit0 DTR, bit1 RTS */
+-			ud.dtr = (value & 1) != 0;
++			ud.dtr = (value & 3) != 0;
+ 			ud_notify_serial_state();
+ 			ok = (length == 0);
+ 			if (ok) {

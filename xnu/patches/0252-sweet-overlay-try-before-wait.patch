@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_overlay.c b/bsd/dev/sweet_overlay.c
+index 389794f..ab23d44 100644
+--- a/bsd/dev/sweet_overlay.c
++++ b/bsd/dev/sweet_overlay.c
+@@ -397,10 +397,6 @@ ov_walk(const uint8_t *bytes, uint64_t size)
+ static void
+ ov_apply(void)
+ {
+-	/* Try anyway even if the probe never succeeded: the probe tests one path,
+-	 * and a failure there says nothing about the other destination. */
+-	(void)ov_wait_writable();
+-
+ 	DTEntry chosen;
+ 	void const *blob = NULL;
+ 	unsigned size = 0;
+@@ -427,6 +423,30 @@ ov_apply(void)
+ 	unsigned varf = ov_nfiles, vard = ov_ndirs, vare = ov_nerrs;
+ 	ov_log("/private/var/local: %u files, %u dirs, %u errors\n", varf, vard, vare);
+ 
++	/* The old order probed a path under /private/var before it tried the
++	 * existing /System/Library directories. When that probe's parent could
++	 * not be created, a payload that could write its real destination waited
++	 * two minutes and never ran. Try both destinations first; wait and retry
++	 * only when a destination reported an error. */
++	if (syse != 0 || vare != 0) {
++		(void)ov_wait_writable();
++		ov_variant = 0;
++		ov_walk(bytes, size);
++		sysf = ov_nfiles;
++		sysd = ov_ndirs;
++		syse = ov_nerrs;
++		ov_log("System retry: %u files, %u dirs, %u errors\n",
++		    sysf, sysd, syse);
++
++		ov_variant = 1;
++		ov_walk(bytes, size);
++		varf = ov_nfiles;
++		vard = ov_ndirs;
++		vare = ov_nerrs;
++		ov_log("/private/var/local retry: %u files, %u dirs, %u errors\n",
++		    varf, vard, vare);
++	}
++
+ 	/* Only the fallback copy is complete, so point Metal at it. */
+ 	if (syse > 0 && vare == 0 && varf > 0) {
+ 		extern void sweet_metal_plugin_set(const char *name);

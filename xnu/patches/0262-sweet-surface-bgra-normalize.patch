@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 1 Nov 2026 17:58:00 +0800
+Subject: [PATCH] sweet-surface: normalize unsupported wide-color formats to BGRA
+
+The 8-bit panel and SweetSurface renderer cannot consume the wide-color
+formats requested once Metal is enabled. WindowServer then switches the
+main display from one-plane BGRA to b3a8 with a separate alpha plane and
+the panel remains black despite framebuffer swaps.
+
+Adopt the compatibility mapping already used by Topaz: present w30r,
+l10r, w30R and b3a8 as BGRA. For b3a8, ignore the supplied plane array so
+the surface is treated as one BGRA plane, as the client expects.
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -288,6 +288,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * The panel and this software surface path only support 8-bit BGRA.
++	 * Once Metal is enabled, WindowServer otherwise selects w30r or b3a8
++	 * (10-bit, and b3a8 has a separate alpha plane), then presents black.
++	 * Keep the client-visible format and layout in the supported format.
++	 */
++	bool onePlane = false;
++	if (s->pixelFormat == 0x77333072u || s->pixelFormat == 0x6c313072u ||
++	    s->pixelFormat == 0x77333052u) {
++		s->pixelFormat = 0x42475241u;              /* BGRA */
++	} else if (s->pixelFormat == 0x62336138u) {
++		s->pixelFormat = 0x42475241u;              /* b3a8 -> BGRA */
++		onePlane = true;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -304,7 +318,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = onePlane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
+-- 
+2.43.0

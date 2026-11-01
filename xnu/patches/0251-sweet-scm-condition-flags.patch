@@ -1,0 +1,11 @@
+diff --git a/bsd/dev/sweet_a6xx_host.c b/bsd/dev/sweet_a6xx_host.c
+--- a/bsd/dev/sweet_a6xx_host.c
++++ b/bsd/dev/sweet_a6xx_host.c
+@@ -204,6 +204,6 @@ a6_smc(uint64_t x[8])
+ 	    :
+ 	    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+-	      "x16", "x17", "memory");
++	      "x16", "x17", "cc", "memory");
+ 	x[0] = x0; x[1] = x1; x[2] = x2; x[3] = x3;
+ 	x[4] = x4; x[5] = x5; x[6] = x6; x[7] = x7;
+ }

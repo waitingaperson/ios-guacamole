@@ -1,0 +1,157 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4356c70..9628ec9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,18 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <vm/pmap.h>
++
++extern "C" bool sweet_gpu_ready(void);
++/* Display-only mappings reserve 18 MiB; Metal import slots remain 16 MiB. */
++extern "C" int sweet_gpu_present_pages(uint64_t key, const uint64_t *pages,
++    uint32_t npages, uint32_t page_size, uint32_t offset, uint32_t width,
++    uint32_t height, uint32_t pitch, uint32_t fb_pitch);
++extern "C" int sweet_console_quarantined;
++
++#define SWEET_FB_GPU_MAX_PAGES          (0x1200000u / PAGE_SIZE)
++static bool sweet_fb_gpu_requested;
++static uint64_t sweet_fb_gpu_pages[SWEET_FB_GPU_MAX_PAGES];
+ 
+ /*
+  * sweetbl=<0..100>: software dimming of the very buffer the SDE scans out.
+@@ -150,6 +160,8 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	bool          fGpuQuarantined;
++	SweetSurface *fGpuQuarantinedSurface; /* retained while the CP may still read it */
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+@@ -233,6 +244,8 @@ AppleCLCD::start(IOService *provider)
+ 			    fLogicalW, fLogicalH, fWidth, fHeight);
+ 		}
+ 	}
++	fGpuQuarantined = false;
++	fGpuQuarantinedSurface = NULL;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -252,6 +264,10 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	uint32_t gpu = 0;
++	sweet_fb_gpu_requested =
++	    PE_parse_boot_argn("sweetfb_gpu", &gpu, sizeof(gpu)) && gpu != 0;
++	IOLog("SWEET FB: A640 blit %s\n", sweet_fb_gpu_requested ? "requested" : "disabled");
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -281,7 +297,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+-	if (fb->fPowerOff) {
++	if (fb->fPowerOff && !fb->fGpuQuarantined) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -370,6 +386,9 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	if (fGpuQuarantined) {
++		return;
++	}
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -385,6 +404,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+ 		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		uint32_t source_w = get32(a, 8), source_h = get32(a, 12);
++		int32_t raw_dx = (int32_t)get32(b, 0), raw_dy = (int32_t)get32(b, 4);
+ 		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
+ 		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+ 		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+@@ -404,6 +425,62 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		uint32_t brightness = 100;
++		bool brightness_ok = !PE_parse_boot_argn("sweetbl", &brightness, sizeof(brightness)) ||
++		    brightness == 100;
++		bool full_canvas = sweet_fb_gpu_requested && sweet_gpu_ready() &&
++		    sweet_fb_fill && brightness_ok && mask == (1u << layer) &&
++		    fPhys == 0x9c000000ULL && fWidth == 1440 && fHeight == 3120 &&
++		    fRowBytes == 5760 && (uint64_t)fRowBytes * fHeight <= 0x1200000ULL &&
++		    sweet_console_muted != 0 &&
++		    raw_dx == 0 && raw_dy == 0 && w == (int32_t)fLogicalW &&
++		    h == (int32_t)fLogicalH && sx == 0 && sy == 0 &&
++		    s->width != 0 && s->height != 0 &&
++		    source_w == s->width && source_h == s->height &&
++		    s->pixelFormat == SWEET_FB_FORMAT_BGRA && s->bytesPerElement == 4 &&
++		    s->elementWidth == 1 && s->elementHeight == 1 &&
++		    s->memory != NULL && s->allocSize != 0 && s->allocSize <= 0x1200000ULL &&
++		    s->allocSize <= s->memory->getLength() && (s->allocSize % PAGE_SIZE) == 0 &&
++		    /* A6XX TPL1 texture bases require 16-byte alignment. */
++		    (s->offset & 0xf) == 0 &&
++		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow +
++		        (uint64_t)s->width * 4 <= s->allocSize;
++		if (full_canvas) {
++			uint32_t npages = 0;
++			uint64_t offset = 0;
++			bool pages_ok = true;
++			while (offset < s->allocSize && npages < SWEET_FB_GPU_MAX_PAGES) {
++				IOByteCount segment = 0;
++				addr64_t pa = s->memory->getPhysicalSegment((off_t)offset, &segment,
++				    kIODirectionInOut);
++				if (pa == 0 || segment == 0 || (pa & (PAGE_SIZE - 1)) != 0 ||
++				    (segment & (PAGE_SIZE - 1)) != 0 ||
++				    segment > s->allocSize - offset ||
++				    npages + segment / PAGE_SIZE > SWEET_FB_GPU_MAX_PAGES) {
++					pages_ok = false;
++					break;
++				}
++				for (IOByteCount k = 0; k < segment; k += PAGE_SIZE) {
++					sweet_fb_gpu_pages[npages++] = pa + k;
++				}
++				offset += segment;
++			}
++			if (pages_ok && offset == s->allocSize && npages != 0) {
++				int gpu_rc = sweet_gpu_present_pages(id, sweet_fb_gpu_pages, npages,
++				    PAGE_SIZE, s->offset, s->width, s->height, s->bytesPerRow, fRowBytes);
++				if (gpu_rc == 0) {
++					s->release();
++					return;
++				}
++				if (gpu_rc == -2) {
++					fGpuQuarantinedSurface = s;
++					sweet_console_quarantined = 1;
++					fGpuQuarantined = true;
++					IOLog("SWEET FB: GPU timeout; source and panel retained until reboot\n");
++					return;
++				}
++			}
++		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -279,2 +279,3 @@
+ int sweet_console_muted;
++int sweet_console_quarantined;
+ #endif
+@@ -283,5 +284,5 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
+-	if (sweet_console_muted && !panic_active()) {
++	if (sweet_console_quarantined || (sweet_console_muted && !panic_active())) {
+ 		return;
+ 	}
