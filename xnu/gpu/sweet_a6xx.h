@@ -143,6 +143,7 @@ struct a6_blit {
 uint32_t a6_blit_ib(const struct a6_gpu *g, const struct a6_blit *b, uint32_t *dw);
 
 #define A6_CP_NOP		0x10
+#define A6_CP_WAIT_MEM_GTE 0x14
 #define A6_CP_WAIT_FOR_IDLE	0x26
 #define A6_CP_BLIT		0x2c
 #define A6_CP_MEM_WRITE		0x3d

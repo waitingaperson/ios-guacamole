@@ -1612,3 +1612,172 @@ Flashed: `work/a6wd/shim-ov4.img` (18.32 MB, RAM only via `fastboot boot`,
   only `/EFI/UniXNU/Payloads/kernel.macho.adt` and
   `/EFI/UniXNU/unixnu.toml` changed. `fsck_msdos -n` and a read-only PyFatFS
   reopen passed on macOS.
+## 2026-11-01 - nil command queue rejected by WindowServer
+
+- The queue-gated image was RAM-booted on `b10aae08`. The policy matched 16
+  times with no framebuffer swaps.
+- `backboardd` received a valid Metal device but crashed eight times after
+  `newCommandQueue*` returned nil. The stable fault was `pc 0x19a083024` /
+  `lr 0x19a083214`; against shared-cache slide `0x11d98000` both resolve inside
+  `CA::WindowServer::EAGLServer::renderer()` in QuartzCore.
+- The caller chain is `EAGLServer::renderer`,
+  `EAGLServer::EAGLServer(IOMFBDisplay *, __CFString const *)`,
+  `CA::WindowServer::AppleDisplay::new_server`,
+  `-[CAWindowServer _detectDisplays]`, and `shared_server_init`.
+- Therefore returning nil is not a usable isolation boundary for
+  WindowServer: it dereferences the queue during display-server construction.
+  A valid queue object is required even when GPU work must be suppressed.
+- Serial log:
+  `E:\CodexProjects\2026-11-01\ban\outputs\ramboot-display-20261101T093110Z\serial.log`.
+
+## 2026-11-01 - command-submit isolation prepared
+
+- Added boot argument
+  `sweetmtlnosubmit=<comma list of process names>`. Listed processes retain the
+  full Metal device, command queue, command buffer, and encoder objects, but
+  queued command buffers complete without calling `SweetCmdStream
+  submitAsync`.
+- This separates userspace command encoding and buffer bookkeeping from the
+  A640 command-stream submission path. It is a diagnostic boundary, not a
+  final rendering mode.
+- The arm64 bundle was built with the iPhoneOS 27.0 SDK and stripped; executable
+  SHA-256 is
+  `27aded42fc80618175c925fd38c18ab4b2233ad8fc7f23907f84b255da3fb75f`.
+- RAM-only test image (no partition write):
+  `E:\CodexProjects\2026-11-01\ban\outputs\metal-nosubmit-backboardd\boot-guacamole-a640-metal-nosubmit-backboardd-20261101T093619Z.img`
+  SHA-256
+  `52cd0ef649df3340598e4da46fd8d2ef9204b76523fe43bf62c6376d7e09630c`.
+  It starts from the known base and adds only
+  `sweetmtlnosubmit=backboardd`; the outer-kernel hash remains
+  `fa649df64efbaeb8aff862317e12fc928351c8dd10ed6995f01a46a553aa35f2`.
+- Packaging validation passed: only `kernel.macho.adt` and `unixnu.toml`
+  changed in the FAT, and `fsck_msdos -n` plus a read-only PyFatFS reopen
+  succeeded.
+
+## 2026-11-01 - no-submit experiment reached a black screen
+
+- The no-submit image was RAM-booted on `b10aae08`; transfer and boot both
+  returned `OKAY`.
+- `backboardd` logged a command buffer, render encoder, passes, and a blit
+  encoder, but it never reached `SweetMTLCommandQueue submitCommandBuffers`.
+  Consequently the `sweetmtlnosubmit=backboardd` policy did not fire.
+- There were 10 framebuffer swaps by frame counter 25, no `CRASH backboardd`,
+  and `GPU ready in 299 ms`. The user then reported that scrolling stopped and
+  the display went black.
+- This run does not prove that GPU submission causes the original corruption:
+  `backboardd` never committed a command buffer in it. It does show that valid
+  Metal objects alone are insufficient to keep the display usable.
+- Serial log:
+  `E:\CodexProjects\2026-11-01\ban\outputs\ramboot-display-20261101T093726Z\serial.log`.
+- Recovery action: RAM-boot the known-good CPU image
+  `outputs\cortexa55-metal-recovery\boot-guacamole-a640-sweetmtl-0-20261101T085544Z.img`
+  (SHA-256 `f8d40cba6fb6538106641e6a51716cc9334dd723c23a6a554540fe2b5bbf2d55`)
+  before running another experiment.
+- Recovery succeeded: the user confirmed that iOS reached the normal system.
+  The serial log contains 16 `SWEET FB: swap` lines and no `CRASH backboardd`:
+  `E:\CodexProjects\2026-11-01\ban\outputs\ramboot-display-20261101T094009Z\serial.log`.
+  Serial capture was stopped with the phone left running normally.
+
+## 2026-11-01 - Metal CPU-write bounds audit
+
+- The original GPU-path log shows `backboardd` created a command queue, command
+  buffer, render encoder, and blit encoder, but never committed the command
+  buffer. Therefore the first `copy_properties` crash cannot be blamed on GPU
+  command execution.
+- The audit found unchecked texture regions and blit spans in SweetMetal. In
+  particular, `replaceRegion` and `getBytes` could underflow
+  `width - origin.x` and write or read past an IOSurface or heap-backed texture.
+- Added strict region and span checks before every CPU copy/fill path:
+  `replaceRegion`, `getBytes`, texture-to-texture blit, buffer-to-texture blit,
+  buffer-to-buffer blit, and `fillBuffer`. Invalid operations are rejected and
+  logged as `bounds reject ...` instead of reaching `memcpy`.
+- Arm64 bundle executable SHA-256:
+  `0daf99472194e04ea1c71425ed8ff0b6e218ef78e168b3b4e3ef5ce45c615616`.
+- Prepared a default all-Metal diagnostic image (no process isolation arguments)
+  with boot marker `sweetmtlbounds=1`:
+  `E:\CodexProjects\2026-11-01\ban\outputs\metal-bounds-20261101\boot-guacamole-a640-metal-bounds-20261101T094611Z.img`
+  SHA-256
+  `2568e1eda031746b5c2ee83696f0217e0f53b4609d6e57b36a9026b04e0ab6e6`.
+- The image keeps the known outer-kernel hash
+  `fa649df64efbaeb8aff862317e12fc928351c8dd10ed6995f01a46a553aa35f2`;
+  packaging validation passed with only the FAT ADT and `unixnu.toml` changed.
+
+## 2026-11-01 - stable GPU path reached; final panel composition was black
+
+- Pulled the current HackiOS and UniXNU GPU sources. HackiOS now publishes
+  `hakios-metal`; UniXNU publishes `AdrenoMetal`, `Adreno740`,
+  `GopFramebuffer`, `AirNir` and `AdrenoPM4`. Both independently confirm that
+  this display path must use 8-bit BGRA and must withhold extended XR10
+  framebuffer capabilities.
+- `SweetMetal.m` now forces `supportsExtendedXR10Formats` to `NO`, disables
+  EDR mirroring and IOSurface compression, sets a headroom of 1, and avoids
+  selecting a half-float framebuffer. Its stripped arm64 executable SHA-256 is
+  `071b305f285627ab010992e063cab7d90b61cf1927bc274de510ebd82fe359c1`.
+- Added Topaz's IOSurface compatibility mapping for `w30r`, `l10r`, `w30R`
+  and `b3a8`: all are presented as one-plane BGRA. Patch
+  `0262-sweet-surface-bgra-normalize.patch`.
+- Repaired `SweetAcceleratorClient` creation to use the standard
+  `initWithTask -> attach -> start` lifecycle. This removed the panic
+  `A kext releasing a(n) SweetAcceleratorClient has corrupted the registry`.
+- The first clean CI kernel lacked the local ZAP and GPU-display patches and
+  failed at `zap: init image rc 1 r1 82`. Aligning `0222` with the local stable
+  candidate and adding `0263-sweet-zap-pool-metadata.patch` restored the known
+  good ZAP path.
+- Successful RAM-boot image:
+  `E:\CodexProjects\2026-11-01\ban\outputs\metal-bgra-stable2-20261101\boot-guacamole-a640-metal-process-policy-20261101T105610Z.img`
+  SHA-256
+  `be66d5431eb0b38aa1df9cbb65742664493c50762849ff07ae7f9bbe146fbc08`;
+  embedded XNU SHA-256
+  `3bf76a2e05cc896e6829c05783b8463c3a1aef328e76b9bb80bf643d90239db7`.
+- Serial evidence:
+  `GPU ready in 299 ms`, `ktest: PASS`, 16 BGRA framebuffer swaps,
+  38 GPU surface imports, 3 first submissions, 8 `backboardd` draws,
+  1 `backboardd` commit plus completion, 0 `backboardd` crashes, 0 kernel
+  panics, 0 bounds rejects, and no wide-color `b3a8`/`w30r` display surface.
+  Log:
+  `E:\CodexProjects\2026-11-01\ban\outputs\ramboot-display-20261101T105824Z\serial.log`.
+- The user still saw a black panel. This isolates the remaining failure to the
+  final GPU panel-copy/composition stage rather than Metal initialization,
+  command encoding, submission, process lifetime, or BGRA surface selection.
+- Prepared one-variable hybrid image with all Metal rendering retained and the
+  known-good CPU panel copy selected by `sweetfb_gpu=0`:
+  `E:\CodexProjects\2026-11-01\ban\outputs\metal-bgra-cpushow-20261101\boot-guacamole-a640-sweetfb_gpu-0-20261101T110349Z.img`
+  SHA-256
+  `fc2ba43573f0a2948e0f0ee01e0a444d294c1adc5d82c8c3d387cfb159a6198f`.
+  Hardware test is pending because the phone was left running the visible CPU
+  recovery image and did not enter Fastboot during the wait window.
+
+## 2026-11-01 - CPU panel copy remains black because every Metal pipeline is missing
+
+- RAM-booted the one-variable hybrid image on `b10aae08`; transfer and boot both
+  returned `OKAY` and the image SHA-256 matched
+  `fc2ba43573f0a2948e0f0ee01e0a444d294c1adc5d82c8c3d387cfb159a6198f`.
+- The hybrid reached iOS, logged `GPU ready in 300 ms`, `ktest: PASS`, 16
+  `SWEET FB: swap` records, 43 IOSurface operations, and no `CRASH backboardd`
+  or kernel panic. The user confirmed that the panel was still black.
+- The serial log contains the decisive cause:
+  `template pass: missing`, `template fixed_color: missing`, and a missing
+  template for every CoreAnimation pipeline. The final 1125x2436 IOSurface pass
+  records three draws, but none reach `SweetCmdStream::draw:` because
+  `SweetPipelineTemplate named:` returns nil. Consequently the target contains
+  only the transparent clear and the CPU present path correctly copies black.
+- This invalidates the earlier inference that GPU command encoding or final
+  composition had failed. GPU bring-up, submission, completion, IOSurface
+  import, and framebuffer presentation all work; the bundle has no
+  `pipelines/*.json` templates to encode actual draws.
+- The same omission was already documented in `METAL-NEXT.md`: a template
+  bundle without `pipelines` draws nothing. The current repo has no tracked or
+  untracked templates, and the packaged bundle also contains only `Info.plist`,
+  `_CodeSignature`, and the executable.
+- Log:
+  `E:\CodexProjects\2026-11-01\ban\outputs\ramboot-display-20261101T111126Z\serial.log`.
+- Recovery image remains
+  `outputs\cortexa55-metal-recovery\boot-guacamole-a640-sweetmtl-0-20261101T085544Z.img`
+  (SHA-256
+  `f8d40cba6fb6538106641e6a51716cc9334dd723c23a6a554540fe2b5bbf2d55`).
+  It keeps A640 bring-up and the GPU service alive with `sweeta6xx=2` while
+  `sweetmtl=0` lets CoreAnimation use the working CPU renderer.
+- Next GPU work must not use `sweetmtl=1` as a UI test until the bundle contains
+  the required `pass`, `fixed_color`, and CoreAnimation pipeline templates, or
+  the template path is replaced by an on-device compiler such as the
+  Metal-to-Vulkan/Turnip path described in `METAL-NEXT.md`.

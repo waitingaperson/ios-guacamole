@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 1 Nov 2026 20:20:00 +0800
+Subject: [PATCH] sweet-pmap: widen ppnum physical addresses before cache sync
+
+pmap_sync_page_attributes_phys shifted a 32-bit ppnum_t before casting.
+On this 4 GiB device a page number above 0xfffff therefore lost its high
+bits and could be passed to the cache dispatcher as an impossible PA.
+Use the architecture ptoa() conversion as the other pmap cache paths do.
+---
+ osfmk/arm/pmap/pmap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6887,7 +6887,7 @@ pmap_sync_page_attributes_phys(
+ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache((vm_offset_t)ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
+-- 
+2.43.0

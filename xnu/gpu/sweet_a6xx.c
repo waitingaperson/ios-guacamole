@@ -815,9 +815,18 @@ int a6_submit_ib(struct a6_gpu *g, uint64_t iova, uint32_t dwords, unsigned time
 	uint64_t fva = a6_pool_va(A6_OFF_SCRATCH);
 	uint32_t fence = ++g->fence;
 	uint32_t dw[] = {
+		a6_pkt7(A6_CP_EVENT_WRITE, 1), 0x19,	/* PC_CCU_INVALIDATE_COLOR */
+		a6_pkt7(A6_CP_EVENT_WRITE, 1), 0x1a,	/* PC_CCU_INVALIDATE_DEPTH */
+		a6_pkt7(A6_CP_EVENT_WRITE, 1), 0x31,	/* CACHE_INVALIDATE */
+		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
 		a6_pkt7(A6_CP_INDIRECT_BUFFER, 3), (uint32_t)iova, (uint32_t)(iova >> 32), dwords,
 		a6_pkt7(A6_CP_WAIT_FOR_IDLE, 0),
-		a6_pkt7(A6_CP_MEM_WRITE, 3), (uint32_t)fva, (uint32_t)(fva >> 32), fence,
+		/* The fence write is also the UCHE clean. Do not set TIMESTAMP:
+		 * the A640 then writes its clock instead of the requested value. */
+		a6_pkt7(A6_CP_EVENT_WRITE, 4), 0x04,	/* CACHE_FLUSH_TS */
+		    (uint32_t)fva, (uint32_t)(fva >> 32), fence,
+		a6_pkt7(A6_CP_WAIT_MEM_GTE, 4), 0,
+		    (uint32_t)fva, (uint32_t)(fva >> 32), fence,
 	};
 	int rc = a6_ring(g, dw, sizeof(dw) / 4, NULL, timeout_ms);
 	return rc || a6_fence_read(g) != fence ? -1 : 0;
