@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_overlay.c b/bsd/dev/sweet_overlay.c
+index ab23d44..1a204b0 100644
+--- a/bsd/dev/sweet_overlay.c
++++ b/bsd/dev/sweet_overlay.c
+@@ -44,6 +44,7 @@ extern int vprintf(const char *fmt, va_list ap);
+ 
+ #define OV_STAMP	"/private/var/local/.sweet-overlay"
+ #define OV_MAXPATH	320
++#define OV_PROBE	"/System/Library/LaunchDaemons/.ovprobe"
+ 
+ /*
+  * The archive stores paths relative to /, and the only entries we care about
+@@ -282,22 +283,19 @@ ov_stamp_matches(uint64_t h)
+ /*
+  * This hook runs from the UFS probe, which is earlier than the rootrw=1 remount,
+  * so a lookup of /System/Library succeeds while the mount is still read-only and
+- * every write fails with EROFS. Poll a real write to the same mount instead.
++ * every write fails with EROFS. Probe a real file in the directory the overlay
++ * must populate; /private/var/local can be absent and made every probe ENOENT.
+  */
+ static int
+ ov_wait_writable(void)
+ {
+ 	static const uint8_t probe[1] = { 'x' };
+-	/* /private/var/local may not exist yet: creating it is itself the first
+-	 * writability test, and probing a missing directory always fails ENOENT. */
+-	(void)ov_mkdir("/private/var", 0755);
+-	(void)ov_mkdir("/private/var/local", 0777);
+ 	/* Fail fast: with sweetovl_halt=1 the first failure is answered by a panic,
+ 	 * so a photo names the errno within a couple of seconds instead of a minute. */
+ 	uint32_t hf = 0;
+ 	int fast = PE_parse_boot_argn("sweetovl_halt", &hf, sizeof(hf)) && hf;
+ 	for (int i = 0; i < (fast ? 20 : 240); i++) {
+-		if (ov_write_file("/private/var/local/.ovprobe", probe, 1, 0644) == 0) {
++		if (ov_write_file(OV_PROBE, probe, 1, 0644) == 0) {
+ 			ov_log("root is writable after %d ms\n", i * 500);
+ 			return 0;
+ 		}

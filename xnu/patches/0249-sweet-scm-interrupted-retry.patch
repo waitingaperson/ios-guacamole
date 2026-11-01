@@ -1,0 +1,38 @@
+diff --git a/bsd/dev/sweet_a6xx.c b/bsd/dev/sweet_a6xx.c
+--- a/bsd/dev/sweet_a6xx.c
++++ b/bsd/dev/sweet_a6xx.c
+@@ -713,12 +713,29 @@ a6_set_zap_region(uint64_t pa, uint32_t size)
+ #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
+ 
+ static int64_t scm(uint32_t cmd, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *r1)
+ {
+-	uint64_t x[8] = { SCM_PIL(cmd), arginfo, a, b, c, 0, 0, 0 };
+-	a6_smc(x);
+-	if (r1)
+-		*r1 = x[1];
+-	return (int64_t)x[0];
++	uint64_t session = 0;
++	uint64_t x[8];
++	for (unsigned attempt = 0; attempt < 100; attempt++) {
++		x[0] = attempt == 0 ? SCM_PIL(cmd) : 1;
++		x[1] = arginfo;
++		x[2] = a;
++		x[3] = b;
++		x[4] = c;
++		x[5] = 0;
++		x[6] = session;
++		x[7] = 0;
++		a6_smc(x);
++		session = x[6];
++		if (x[0] != 1) {
++			if (r1)
++				*r1 = x[1];
++			return (int64_t)x[0];
++		}
++	}
++	if (r1)
++		*r1 = x[1];
++	return -1;
+ }
+ 
+ static int zap_load(struct a6_gpu *g)

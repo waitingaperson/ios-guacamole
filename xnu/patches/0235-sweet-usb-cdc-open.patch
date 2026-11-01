@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -330,6 +330,8 @@ static struct {
+ 	bool        configured;
+ 	bool        dtr;            /* the host opened the port */
+ 	bool        tx_busy;
++	bool        int_busy;
++	bool        int_pending;
+ 	uint64_t    log_pos;        /* committed console position */
+ 	uint64_t    log_pos_next;   /* position once the IN transfer completes */
+ } ud;
+@@ -482,5 +484,11 @@ ud_notify_serial_state(void)
++	if (ud.int_busy) {
++		ud.int_pending = true;
++		return;
++	}
++	ud.int_busy = true;
++	ud.int_pending = false;
+ 	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
+ 	n[0] = 0xa1; n[1] = 0x20;       /* SERIAL_STATE */
+ 	n[2] = 0; n[3] = 0;             /* wValue */
+ 	n[4] = 0; n[5] = 0;             /* wIndex: interface 0 */
+ 	n[6] = 2; n[7] = 0;             /* wLength: 2 */
+@@ -515,6 +521,5 @@ ud_configure(void)
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+-	ud_notify_serial_state();
+ 	printf("SWEET USB: ACM endpoints configured\n");
+ }
+@@ -544,6 +549,7 @@ ud_setup(void)
+ 			break;
+ 		case 0x22:              /* SET_CONTROL_LINE_STATE: bit0 DTR, bit1 RTS */
+ 			ud.dtr = (value & 1) != 0;
++			ud_notify_serial_state();
+ 			ok = (length == 0);
+ 			if (ok) {
+ 				printf("SWEET USB: port %s by the host\n", ud.dtr ? "opened" : "closed");
+@@ -633,6 +640,6 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	for (;;) {
+ 		ud_sleep_ms(20);
+-		if (!ud.configured || ud.tx_busy) {
++		if (!ud.configured || !ud.dtr || ud.tx_busy) {
+ 			continue;
+ 		}
+ 		uint64_t next = ud.log_pos;
+@@ -684,7 +691,10 @@ ud_event(uint32_t ev)
+ 		return;
+ 	}
+ 	if (ep == EP_INT && type == 1) {        /* notification taken */
+-		ud_notify_serial_state();
++		ud.int_busy = false;
++		if (ud.int_pending) {
++			ud_notify_serial_state();
++		}
+ 		return;
+ 	}
+ 	if (ep > 1) {

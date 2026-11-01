@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 1 Nov 2026 18:47:00 +0800
+Subject: [PATCH] sweet-a6xx: preserve the verified cache invalidate mode
+
+The Cortex-A55 build used for the verified recovery image invalidates GPU
+buffer cache lines instead of cleaning them before submission. Keep that
+proven cache-maintenance setting on top of the current GPU host.
+---
+ bsd/dev/sweet_a6xx_host.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_a6xx_host.c b/bsd/dev/sweet_a6xx_host.c
+--- a/bsd/dev/sweet_a6xx_host.c
++++ b/bsd/dev/sweet_a6xx_host.c
+@@ -728,7 +728,7 @@ sweet_a6xx_bo_cache_flush(uint64_t handle, uint64_t offset, uint64_t len)
+ 	if (len > b->size - offset) {
+ 		len = b->size - offset;
+ 	}
+-	flush_dcache64((addr64_t)(b->kva + offset), (unsigned)len, TRUE);
++	flush_dcache64((addr64_t)(b->kva + offset), (unsigned)len, FALSE);
+ 	return 0;
+ }
+ 
+-- 
+2.43.0

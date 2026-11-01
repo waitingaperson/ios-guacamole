@@ -1,0 +1,56 @@
+name: shim-rmx
+
+# Builds the a640 GPU bring-up shim (shim-rmx/) on a Linux runner.
+# inputs:
+#   showlog: "1" -> also build the variant that renders the previous run's log
+#            on the screen (SHIM_SHOWLOG), which is how the probe log is read.
+
+on:
+  workflow_dispatch:
+    inputs:
+      showlog:
+        description: 'Build the SHIM_SHOWLOG variant as well'
+        required: false
+        default: '1'
+  push:
+    paths:
+      - 'shim-rmx/**'
+      - '.github/workflows/shim-rmx.yml'
+
+jobs:
+  shim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装交叉工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 编 shim-rmx（探针）
+        working-directory: shim-rmx
+        run: |
+          NO_PACK=1 bash build.sh
+          # 存到 out/ 外面：下一步的 `rm -rf out` 会把它一起删掉
+          cp out/Image Image.gpuprobe
+          ls -l Image.gpuprobe
+
+      - name: 编 shim-rmx（showlog）
+        working-directory: shim-rmx
+        run: |
+          rm -rf out
+          SHIM_CFLAGS=-DSHIM_SHOWLOG NO_PACK=1 bash build.sh
+          cp out/Image Image.showlog
+          ls -l Image.showlog out/shim.elf
+          aarch64-linux-gnu-size out/shim.elf
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-rmx
+          path: |
+            shim-rmx/Image.gpuprobe
+            shim-rmx/Image.showlog
+          if-no-files-found: error

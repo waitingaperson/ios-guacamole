@@ -1,0 +1,18 @@
+sweet-logdump: also dump our own lines from the previous boot
+
+The ring dump filter only keeps crashes and daemon failures, so a silent
+overlay or Metal failure leaves no evidence anywhere. Add the kernel's
+"SWEET " prefix plus the userspace driver's "SweetAccel"/"template " lines.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -812,7 +812,7 @@
+ sweet_log_wanted(const char *l)
+ {
+ 	static const char * const keys[] = {
+-		"CRASH ", "exited", "Exit", "failed", "Failed", "error", "Error",
++		"CRASH ", "SWEET ", "SweetAccel", "template ", "exited", "Exit", "failed", "Failed", "error", "Error",
+ 		"panic", "SpringBoard", "xpcproxy", "fairplayd", "bluetoothd",
+ 		"watchdog", "boot task", "mount", "fsck", "keybag", "AMFI", "abort",
+ 		"timeout", "Timeout", "not found", "No such",
