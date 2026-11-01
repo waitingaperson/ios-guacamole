@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_overlay.c b/bsd/dev/sweet_overlay.c
+index 1a204b0..0f13f49 100644
+--- a/bsd/dev/sweet_overlay.c
++++ b/bsd/dev/sweet_overlay.c
+@@ -46,6 +46,9 @@ extern int vprintf(const char *fmt, va_list ap);
+ #define OV_MAXPATH	320
+ #define OV_PROBE	"/System/Library/LaunchDaemons/.ovprobe"
+ 
++static volatile uint32_t ov_running;
++static volatile uint32_t ov_complete;
++
+ /*
+  * The archive stores paths relative to /, and the only entries we care about
+  * live under this prefix. Variant 1 re-roots just the bundle into
+@@ -484,16 +487,35 @@ ov_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 	}
+ 	ov_apply();
++	__atomic_store_n(&ov_complete, 1, __ATOMIC_RELEASE);
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++int
++sweet_overlay_wait(uint32_t timeout_ms)
++{
++	if (__atomic_load_n(&ov_running, __ATOMIC_ACQUIRE) == 0) {
++		return 0;
++	}
++	for (uint32_t waited = 0; waited <= timeout_ms; waited += 10) {
++		if (__atomic_load_n(&ov_complete, __ATOMIC_ACQUIRE) != 0) {
++			return 0;
++		}
++		delay(10 * 1000);
++	}
++	return -1;
++}
++
+ void
+ sweet_overlay_start(void)
+ {
+ 	thread_t thread;
++	__atomic_store_n(&ov_running, 1, __ATOMIC_RELEASE);
+ 	if (kernel_thread_start(ov_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++	} else {
++		__atomic_store_n(&ov_complete, 1, __ATOMIC_RELEASE);
+ 	}
+ }
+ 
