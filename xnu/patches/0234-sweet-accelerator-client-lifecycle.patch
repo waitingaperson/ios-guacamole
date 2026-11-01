@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sun, 1 Nov 2026 18:20:00 +0800
+Subject: [PATCH] sweet: initialize accelerator user clients through IOKit
+
+SweetAcceleratorClient bypassed initWithTask(), attached itself, and never
+started. Its owner and registry state were therefore incomplete; closing a
+Metal client made IOUserClient release an object whose retain count was
+below its collection participation count, panicking in OSObject.cpp.
+
+Create the client exactly as IOService's default user-client constructor
+does: initWithTask(), attach(), start(), then hand the +1 reference to the
+caller. Also avoid a second terminate() for an inactive client.
+---
+ iokit/Kernel/arm/SweetAccelerator.cpp | 10 ++++++----
+ bsd/dev/sweet_accel_client.cpp        | 23 ++++++++++++++++++-----
+ 2 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -112,15 +112,16 @@ sweet_metal_plugin_set(const char *name)
+ }
+ 
+ /* The user client lives in bsd/dev/sweet_accel_client.cpp. */
+-extern "C" IOService *sweet_accel_create_user_client(IOService *provider);
++extern "C" IOService *sweet_accel_create_user_client(IOService *provider,
++    task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties);
+ 
+ IOReturn
+ SweetAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
+     OSDictionary *properties, IOUserClient **handler)
+ {
+-	(void)owningTask; (void)securityID; (void)type; (void)properties;
+ 	if (handler == NULL) return kIOReturnBadArgument;
+-	IOService *client = sweet_accel_create_user_client(this);
++	IOService *client = sweet_accel_create_user_client(
++	    this, owningTask, securityID, type, properties);
+ 	if (client == NULL) return kIOReturnNoMemory;
+ 	IOUserClient *uc = OSDynamicCast(IOUserClient, client);
+ 	if (uc == NULL) { client->release(); return kIOReturnError; }
+diff --git a/bsd/dev/sweet_accel_client.cpp b/bsd/dev/sweet_accel_client.cpp
+--- a/bsd/dev/sweet_accel_client.cpp
++++ b/bsd/dev/sweet_accel_client.cpp
+@@ -44,7 +44,8 @@ int sweet_a6xx_surface_import_pages(uint32_t id, const uint64_t *pages, uint32_t
+ bool sweet_gpu_ready(void);
+ }
+ 
+-extern "C" IOService *sweet_accel_create_user_client(IOService *provider);
++extern "C" IOService *sweet_accel_create_user_client(IOService *provider,
++    task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties);
+ 
+ class SweetAcceleratorClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(SweetAcceleratorClient)
+@@ -101,12 +102,15 @@ void
+ SweetAcceleratorClient::stop(IOService *provider)
+ {
+ 	IOUserClient::stop(provider);
++	fProvider = NULL;
+ }
+ 
+ IOReturn
+ SweetAcceleratorClient::clientClose(void)
+ {
+-	terminate(kIOServiceSynchronous);
++	if (!isInactive()) {
++		terminate();
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -256,13 +260,14 @@ SweetAcceleratorClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+ }
+ 
+ IOService *
+-sweet_accel_create_user_client(IOService *provider)
++sweet_accel_create_user_client(IOService *provider, task_t owningTask,
++    void *securityID, UInt32 type, OSDictionary *properties)
+ {
+ 	SweetAcceleratorClient *client = new SweetAcceleratorClient;
+ 	if (client == NULL) {
+ 		return NULL;
+ 	}
+-	if (!client->init()) {
++	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+ 		client->release();
+ 		return NULL;
+ 	}
+@@ -270,7 +275,11 @@ sweet_accel_create_user_client(IOService *provider)
+ 		client->release();
+ 		return NULL;
+ 	}
+-	client->release();	/* attach retains */
++	if (!client->start(provider)) {
++		client->detach(provider);
++		client->release();
++		return NULL;
++	}
+ 	return client;
+ }
+ 
+-- 
+2.43.0
