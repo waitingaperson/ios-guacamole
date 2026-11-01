@@ -1,0 +1,31 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..4fb571f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6884,6 +6884,26 @@ load_init_program(proc_t p)
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
++#if ARM64_BOARD_CONFIG_GUACAMOLE
++	uint32_t probe_init = 0;
++	if (PE_parse_boot_argn("sweetprobeinit", &probe_init, sizeof(probe_init)) &&
++	    probe_init) {
++		extern int sweet_overlay_wait(uint32_t timeout_ms);
++		printf("load_init_program: waiting for the verified userspace overlay\n");
++		if (sweet_overlay_wait(5000) == 0) {
++			error = load_init_program_at_path(p, (user_addr_t)scratch_addr,
++			    "/usr/libexec/run-gpu-probes-init");
++			if (!error) {
++				return;
++			}
++			printf("load_init_program: probe init failed: errno %d; continuing to launchd\n",
++			    error);
++		} else {
++			printf("load_init_program: overlay wait timed out; continuing to launchd\n");
++		}
++	}
++#endif
++
+ #if DEBUG || DEVELOPMENT
+ 	/* Check for boot-arg suffix first */
+ 	char launchd_suffix[64];
