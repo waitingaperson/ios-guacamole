@@ -43,6 +43,9 @@ jobs:
             mkdir -p "$THEOS/toolchain"
             curl -fL --retry 3 --retry-delay 5 -sS \
               "$THEOS_TOOLCHAIN_URL" | tar -xJ -C "$THEOS/toolchain/"
+            # The release carries Apple's linker as bin/ld; HakiOS's
+            # setup script uses the traditional Linux cctools name.
+            ln -sfn ld "$THEOS/toolchain/linux/iphone/bin/ld64"
           fi
           if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" ]; then
             rm -rf "$THEOS/sdks/iPhoneOS16.5.sdk" /tmp/theos-sdks
