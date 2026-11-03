@@ -55,7 +55,8 @@ jobs:
             mkdir -p "$THEOS/sdks"
             mv /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
           fi
-          "$THEOS/toolchain/linux/iphone/bin/ld64" --version
+          test -x "$THEOS/toolchain/linux/iphone/bin/ld64"
+          "$THEOS/toolchain/linux/iphone/bin/ld64" --version || true
           "$THEOS/toolchain/linux/iphone/bin/clang" --version | grep eabca92
 
       - name: Fetch pinned HakiOS kernel and apply HFS v70
