@@ -1,0 +1,110 @@
+name: hfs-builtin-v70
+
+on:
+  push:
+    branches:
+      - codex/hfs-builtin-v70-20261103
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      THEOS: /home/runner/theos
+      THEOS_TOOLCHAIN_URL: https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz
+      KERNEL_REPO: https://github.com/Gsjsjzhznsz/hackios-xnu-kernel.git
+      KERNEL_COMMIT: 4c0ed41d78e6bcbff57d3d32d678c965f49cd1e4
+      XNU_TREE: xnu-src/xnu-8796.121.2
+      KERNEL: xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential python3-dev clang lld ccache flex bison m4 perl \
+            python3 autoconf automake libtinfo6 xz-utils uuid-dev 7zip ripgrep git curl
+
+      - name: Install pinned HakiOS toolchain and iOS 16.5 SDK
+        run: |
+          set -euxo pipefail
+          if [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld64" ]; then
+            rm -rf "$THEOS"
+            git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+            mkdir -p "$THEOS/toolchain"
+            curl -fL --retry 3 --retry-delay 5 -sS \
+              "$THEOS_TOOLCHAIN_URL" | tar -xJ -C "$THEOS/toolchain/"
+          fi
+          if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" ]; then
+            rm -rf "$THEOS/sdks/iPhoneOS16.5.sdk" /tmp/theos-sdks
+            git clone --depth 1 --filter=blob:none --sparse \
+              https://github.com/theos/sdks.git /tmp/theos-sdks
+            git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
+            mkdir -p "$THEOS/sdks"
+            mv /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          fi
+          "$THEOS/toolchain/linux/iphone/bin/ld64" --version
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version | grep eabca92
+
+      - name: Fetch pinned HakiOS kernel and apply HFS v70
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euxo pipefail
+          git clone --filter=blob:none --no-checkout "$KERNEL_REPO" hackios
+          git -C hackios fetch --depth 1 origin "$KERNEL_COMMIT"
+          git -C hackios checkout --detach FETCH_HEAD
+          test "$(git -C hackios rev-parse HEAD)" = "$KERNEL_COMMIT"
+          cd hackios
+          xnu/apply.sh
+          cp -a "$GITHUB_WORKSPACE/v70/xnu-root/." "$XNU_TREE/"
+          test -f "$XNU_TREE/bsd/hfs/hfs_builtin.c"
+          test -f "$XNU_TREE/bsd/hfs/hfs_vfsops.c"
+          grep -q 'options.*HFS' "$XNU_TREE/config/MASTER"
+          grep -q 'bsd/hfs/hfs_vfsops.c.*optional hfs' "$XNU_TREE/bsd/conf/files"
+          grep -q 'hfs_vfsops' "$XNU_TREE/bsd/vfs/vfs_conf.c"
+
+      - name: Build XNU with built-in HFS
+        working-directory: ${{ github.workspace }}/hackios
+        run: |
+          set -euxo pipefail
+          export XNU_HOST_CLANG="$THEOS/toolchain/linux/iphone/bin/clang"
+          export XNU_CCACHE=1 CCACHE_COMPILERCHECK=content
+          export XNU_WRAPPER_LOG="$PWD/xnu-clang-args.log"
+          ccache -C >/dev/null 2>&1 || true
+          ccache -M 2G >/dev/null 2>&1 || true
+          bash xnu-deps/setup.sh
+          set +e
+          ./xnu-build.sh -j4 -k BUILD_DSYM=0 2>&1 | tee v70-build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "xnu-build exit status: $status"
+          test -s "$KERNEL"
+          mkdir -p v70-out
+          cp "$KERNEL" v70-out/mach.development.bcm2837
+          KU="$KERNEL.unstripped"
+          test -s "$KU" && cp "$KU" v70-out/mach.development.bcm2837.unstripped
+          AS="$XNU_TREE/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/config/allsymbols"
+          test -f "$AS" && cp "$AS" v70-out/allsymbols.txt
+          cp v70-build.log v70-out/
+          cp xnu-clang-args.log v70-out/ 2>/dev/null || true
+          NM="$THEOS/toolchain/linux/iphone/bin/llvm-nm"
+          test -x "$NM"
+          "$NM" v70-out/mach.development.bcm2837 | grep -E '(_| )hfs_(vfsops|mount|vnodeop_opv_desc|specop_opv_desc|fifoop_opv_desc)$'
+          sha256sum v70-out/mach.development.bcm2837 | tee v70-out/SHA256SUMS
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: hfs-builtin-v70-kernel
+          path: hackios/v70-out/
+          if-no-files-found: error
+          retention-days: 14
