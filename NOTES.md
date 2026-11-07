@@ -1002,6 +1002,30 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - `research/` mainline sm7150 dts, XNU pe_fiq.c etc, PocketDarwin patches
 - `tools/unpack_bootv2.py`
 
+## 2026-11-07 - iOS 27 arm64e/PAC hardware gate
+
+- A RAM-only probe booted on guacamole and measured
+  `ID_AA64ISAR1_EL1=0x0000000000100001`: `APA=API=GPA=GPI=0`. The PAC verdict
+  is `NO FEAT_PAuth`, so SM8150 cannot execute an iOS 27 arm64e system. No
+  loader, XNU, EL2 or driver change can provide the missing hardware feature.
+- Probe SHA-256:
+  `42e651cbab8f6dd3cf48757b68c2a0aed74e43648c43f29e91a876c385e56366`.
+  The test used `fastboot boot` only and did not write a partition.
+- The native arm64 XNU build completed on the Mac with kernel SHA-256
+  `38389807932433e0fd6810ef4dcdb925aef901ede99cda063e27dcb8530a121b`.
+  Its prelink candidate SHA-256 is
+  `e596050d551997260f00d965fa4a3c2c44caa403eac9f833f19da081cede73aa`.
+  XnuPrelink reports `loadable=false` and the candidate has not been booted;
+  this is a toolchain/ABI baseline, not a working iOS 27 image.
+- The iPadOS 17.7.11 21H461 target used for that compile is an arm64 validation
+  profile only. It is not the requested final target and was not treated as
+  evidence that iOS 27 can run on SM8150.
+- Continue the OnePlus 7 Pro on iOS 16.7.16 or investigate a verified iOS 18
+  arm64 profile. An actual iOS 27 route requires an arm64e-capable device;
+  SM8550 with the UniXNU `sheng` reference is the current preferred research
+  platform, but still requires its own device port.
+- Details: `docs/ios27-arm64e-hardware-gate.md`.
+
 ## Device access
 - No root in PixelOS 17 (user build, adb root disabled). Root = `fastboot boot recovery/recovery.img` (OrangeFox R12.0_2, temp boot, not flashed).
 - `fastboot boot` works for stock boot.img, OrangeFox, and our shim.
